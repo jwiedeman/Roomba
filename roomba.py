@@ -1,11 +1,11 @@
 import requests
 from bs4 import BeautifulSoup
 import mysql.connector
+from mysql.connector import pooling
 import random
 import time
-from concurrent.futures import ThreadPoolExecutor, as_completed
+from concurrent.futures import ThreadPoolExecutor
 import curses
-from mysql.connector import pooling
 
 # Database configuration
 DB_HOST = 'localhost'
@@ -70,36 +70,35 @@ def save_domains(domains, crawled_status='no'):
     db = connection_pool.get_connection()
     cursor = db.cursor()
     newly_added = []
-    insert_query = "INSERT INTO domains (domain, crawled) VALUES (%s, %s)"
+    insert_query = "INSERT INTO domains (domain, crawled) VALUES (%s, %s) ON DUPLICATE KEY UPDATE domain=domain"
     for domain in domains:
         try:
             cursor.execute(insert_query, (domain, crawled_status))
-            db.commit()
             newly_added.append(domain)
         except mysql.connector.errors.IntegrityError:
             pass
+    db.commit()  # Commit once for all new domains
     cursor.close()
     db.close()
     return newly_added
 
-# Read uncrawled domain from the database
-def get_uncrawled_domain():
+# Retrieve a single uncrawled domain from the database and mark it as crawled
+def get_and_mark_uncrawled_domain():
     db = connection_pool.get_connection()
     cursor = db.cursor(dictionary=True)
-    cursor.execute("SELECT domain FROM domains WHERE crawled='no' ORDER BY RAND() LIMIT 1")
-    result = cursor.fetchone()
-    cursor.close()
-    db.close()
-    return result['domain'] if result else None
-
-# Mark a domain as crawled
-def mark_domain_as_crawled(domain):
-    db = connection_pool.get_connection()
-    cursor = db.cursor()
-    cursor.execute("UPDATE domains SET crawled='yes' WHERE domain=%s", (domain,))
-    db.commit()
-    cursor.close()
-    db.close()
+    try:
+        cursor.execute("SELECT domain FROM domains WHERE crawled='no' LIMIT 1 FOR UPDATE SKIP LOCKED")
+        result = cursor.fetchone()
+        if result:
+            cursor.execute("UPDATE domains SET crawled='yes' WHERE domain=%s", (result['domain'],))
+            db.commit()
+            return result['domain']
+    except mysql.connector.Error as err:
+        print(f"Database error: {err}")
+    finally:
+        cursor.close()
+        db.close()
+    return None
 
 # Crawl a domain
 def crawl_domain(domain, log, newly_added_log, session):
@@ -107,46 +106,21 @@ def crawl_domain(domain, log, newly_added_log, session):
     links = get_links_from_page(f'http://{domain}', session)
     domains = extract_domains(links)
     newly_added = save_domains(domains)
-    mark_domain_as_crawled(domain)
     log.append(f"Finished crawling http://{domain}")
     for new_domain in newly_added:
         newly_added_log.append(f"New domain added: http://{new_domain}")
-    time.sleep(0.5)  # Slow down the crawling to avoid hammering servers
-
-# Recrawl a domain for deeper links
-def recrawl_domain(domain, log, newly_added_log, session):
-    log.append(f"Recrawling http://{domain} for deeper links...")
-    sitemap_url = f'http://{domain}/sitemap.xml'
-    links = get_links_from_page(sitemap_url, session)
-    additional_links = links[:10]  # Taking the first 10 links
-    for link in additional_links:
-        links += get_links_from_page(link, session)
-    domains = extract_domains(links)
-    newly_added = save_domains(domains)
-    log.append(f"Finished recrawling http://{domain}")
-    for new_domain in newly_added:
-        newly_added_log.append(f"New domain added: http://{new_domain}")
-    time.sleep(0.5)  # Slow down the crawling to avoid hammering servers
+    time.sleep(0.1)  # Reduce sleep time to increase crawling speed
 
 # Worker function for threads
 def worker(log, newly_added_log, last_active_time, thread_id, session):
     while True:
-        domain = get_uncrawled_domain()
+        domain = get_and_mark_uncrawled_domain()
         if domain:
             crawl_domain(domain, log, newly_added_log, session)
         else:
-            db = connection_pool.get_connection()
-            cursor = db.cursor(dictionary=True)
-            cursor.execute("SELECT domain FROM domains WHERE crawled='yes'")
-            results = cursor.fetchall()
-            cursor.close()
-            db.close()
-            if results:
-                random_domain = random.choice(results)['domain']
-                recrawl_domain(random_domain, log, newly_added_log, session)
-            else:
-                log.append("No domains left to crawl.")
-                break
+            log.append("No uncrawled domains left.")
+            break
+
         last_active_time[thread_id] = time.time()
 
 # Function to get stats from the database
@@ -202,9 +176,9 @@ def main(stdscr):
 
         # Show the last 'max_log_entries' of each log
         for i, log_entry in enumerate(log[-max_log_entries:], start=5):
-            stdscr.addstr(i, 0, log_entry, curses.color_pair(1))
+            stdscr.addstr(i, 0, log_entry[:width-1], curses.color_pair(1))
         for i, log_entry in enumerate(newly_added_log[-max_log_entries:], start=5):
-            stdscr.addstr(i, 50, log_entry, curses.color_pair(2))
+            stdscr.addstr(i, 50, log_entry[:width-51], curses.color_pair(2))
 
         stdscr.refresh()
 
@@ -216,7 +190,7 @@ def main(stdscr):
         if all(future.done() for future in futures.values()):
             break
 
-        time.sleep(1)  # Refresh the console every second
+        time.sleep(0.1)  # Reduce the refresh rate to 0.1 seconds for faster updates
 
     executor.shutdown()
 
