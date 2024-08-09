@@ -6,6 +6,8 @@ import random
 import time
 from concurrent.futures import ThreadPoolExecutor
 import curses
+import logging
+import threading
 
 # Database configuration
 DB_HOST = 'localhost'
@@ -14,7 +16,7 @@ DB_PASSWORD = '1234'
 DB_NAME = 'domain_scraper'
 
 # Create a connection pool
-connection_pool = pooling.MySQLConnectionPool(
+connection_pool = mysql.connector.pooling.MySQLConnectionPool(
     pool_name="mypool",
     pool_size=20,
     host=DB_HOST,
@@ -22,6 +24,9 @@ connection_pool = pooling.MySQLConnectionPool(
     password=DB_PASSWORD,
     database=DB_NAME
 )
+
+# Initialize logging
+logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 
 # Initialize the database and table
 def initialize_db():
@@ -40,6 +45,19 @@ def initialize_db():
     cursor.close()
     db.close()
 
+# Normalize domain to avoid duplicates
+def normalize_domain(domain):
+    # Remove protocol
+    if domain.startswith('http://'):
+        domain = domain[7:]
+    elif domain.startswith('https://'):
+        domain = domain[8:]
+    # Remove "www."
+    if domain.startswith('www.'):
+        domain = domain[4:]
+    # Convert to lowercase
+    return domain.lower()
+
 # Get links from a webpage
 def get_links_from_page(url, session):
     headers = {
@@ -53,7 +71,8 @@ def get_links_from_page(url, session):
         soup = BeautifulSoup(response.text, 'html.parser')
         links = [a.get('href') for a in soup.find_all('a', href=True)]
         return links
-    except requests.RequestException:
+    except requests.RequestException as e:
+        logging.error(f"Error fetching {url}: {e}")
         return []
 
 # Extract top-level domains from links
@@ -62,24 +81,34 @@ def extract_domains(links):
     for link in links:
         if link.startswith('http'):
             domain = link.split('/')[2]
-            domains.add(domain)
+            domains.add(normalize_domain(domain))
     return domains
 
 # Save domains to the database in batches
 def save_domains(domains, crawled_status='no'):
+    if not domains:
+        return []
+    
     db = connection_pool.get_connection()
     cursor = db.cursor()
     newly_added = []
     insert_query = "INSERT INTO domains (domain, crawled) VALUES (%s, %s) ON DUPLICATE KEY UPDATE domain=domain"
-    for domain in domains:
-        try:
+    
+    # Use individual inserts to check for new entries
+    try:
+        for domain in domains:
             cursor.execute(insert_query, (domain, crawled_status))
-            newly_added.append(domain)
-        except mysql.connector.errors.IntegrityError:
-            pass
-    db.commit()  # Commit once for all new domains
-    cursor.close()
-    db.close()
+            if cursor.rowcount == 1:  # Check if a row was inserted
+                newly_added.append(domain)
+    except mysql.connector.errors.IntegrityError as e:
+        logging.error(f"Integrity error: {e}")
+    except mysql.connector.Error as e:
+        logging.error(f"Database error: {e}")
+    finally:
+        db.commit()
+        cursor.close()
+        db.close()
+    
     return newly_added
 
 # Retrieve a single uncrawled domain from the database and mark it as crawled
@@ -94,7 +123,7 @@ def get_and_mark_uncrawled_domain():
             db.commit()
             return result['domain']
     except mysql.connector.Error as err:
-        print(f"Database error: {err}")
+        logging.error(f"Database error: {err}")
     finally:
         cursor.close()
         db.close()
@@ -123,19 +152,27 @@ def worker(log, newly_added_log, last_active_time, thread_id, session):
 
         last_active_time[thread_id] = time.time()
 
-# Function to get stats from the database
-def get_stats():
-    db = connection_pool.get_connection()
-    cursor = db.cursor(dictionary=True)
-    cursor.execute("SELECT COUNT(domain) AS total FROM domains")
-    total = cursor.fetchone()['total']
-    cursor.execute("SELECT COUNT(domain) AS crawled FROM domains WHERE crawled='yes'")
-    crawled = cursor.fetchone()['crawled']
-    cursor.execute("SELECT COUNT(domain) AS uncrawled FROM domains WHERE crawled='no'")
-    uncrawled = cursor.fetchone()['uncrawled']
-    cursor.close()
-    db.close()
-    return total, crawled, uncrawled
+# Function to periodically update stats from the database
+def update_stats(stats, lock):
+    while True:
+        db = connection_pool.get_connection()
+        cursor = db.cursor(dictionary=True)
+        cursor.execute("SELECT COUNT(domain) AS total FROM domains")
+        total = cursor.fetchone()['total']
+        cursor.execute("SELECT COUNT(domain) AS crawled FROM domains WHERE crawled='yes'")
+        crawled = cursor.fetchone()['crawled']
+        cursor.execute("SELECT COUNT(domain) AS uncrawled FROM domains WHERE crawled='no'")
+        uncrawled = cursor.fetchone()['uncrawled']
+        cursor.close()
+        db.close()
+
+        # Update shared stats with lock
+        with lock:
+            stats['total'] = total
+            stats['crawled'] = crawled
+            stats['uncrawled'] = uncrawled
+
+        time.sleep(1)  # Update stats every second
 
 # Main function to control the crawling process and update the console
 def main(stdscr):
@@ -150,6 +187,14 @@ def main(stdscr):
 
     last_active_time = {i: time.time() for i in range(max_threads)}
 
+    stats = {'total': 0, 'crawled': 0, 'uncrawled': 0}
+    lock = threading.Lock()
+
+    # Start a separate thread for updating stats
+    stats_thread = threading.Thread(target=update_stats, args=(stats, lock))
+    stats_thread.daemon = True
+    stats_thread.start()
+
     def restart_thread(thread_id):
         log.append(f"Restarting thread {thread_id}")
         last_active_time[thread_id] = time.time()
@@ -161,7 +206,13 @@ def main(stdscr):
 
     while True:
         stdscr.clear()
-        total, crawled, uncrawled = get_stats()
+
+        # Safely read stats with lock
+        with lock:
+            total = stats['total']
+            crawled = stats['crawled']
+            uncrawled = stats['uncrawled']
+
         stdscr.addstr(0, 0, f"Total domains: {total:,}")
         stdscr.addstr(1, 0, f"Crawled domains: {crawled:,}")
         stdscr.addstr(2, 0, f"Uncrawled domains: {uncrawled:,}")
@@ -190,7 +241,7 @@ def main(stdscr):
         if all(future.done() for future in futures.values()):
             break
 
-        time.sleep(0.1)  # Reduce the refresh rate to 0.1 seconds for faster updates
+        time.sleep(1)  # Refresh console every second
 
     executor.shutdown()
 
